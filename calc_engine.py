@@ -166,6 +166,35 @@ _OPERATORS: dict[type[ast.operator], Callable[[float, float], float]] = {
 }
 
 
+def formula_variables(formula_str: str) -> list[str]:
+    """Discover validated formula inputs using the engine's restricted SymPy parser.
+
+    Preserve inputs of original operations even when symbolic simplification
+    cancels them, so domain checks still receive their values.
+    """
+    if not formula_str.strip():
+        raise FormulaParseError("Введите формулу.")
+    if len(formula_str) > 1000:
+        raise FormulaParseError("Формула должна содержать не более 1000 символов.")
+    try:
+        tree = ast.parse(formula_str.strip(), mode="eval").body
+    except (SyntaxError, ValueError, RecursionError) as exc:
+        raise FormulaParseError("Проверьте скобки и операции в формуле.") from exc
+    names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)} - set(_FUNCTIONS) - set(_CONSTANTS)
+    if any(name.startswith("_") for name in names):
+        raise FormulaParseError("Имена переменных не должны начинаться с подчёркивания.")
+    _validate_formula(tree, names | set(_CONSTANTS))
+    try:
+        parse_expr(
+            formula_str.strip(),
+            local_dict={**_FUNCTIONS, **_CONSTANTS, **{name: sp.Symbol(name, real=True) for name in names}},
+            global_dict={"__builtins__": {}, "Integer": sp.Integer, "Float": sp.Float},
+        )
+    except (TypeError, ValueError, SyntaxError) as exc:
+        raise FormulaParseError("Не удалось разобрать формулу.") from exc
+    return sorted(names)
+
+
 def _validate_formula(node: ast.AST, names: set[str]) -> None:
     """Accept only arithmetic, known variables and supported one-argument functions."""
     if isinstance(node, ast.Constant) and type(node.value) in (int, float):

@@ -2,3 +2,4 @@
 .agents/
 .promts/
 __pycache__/
+artifacts/
