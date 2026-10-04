@@ -1,0 +1,4 @@
+.venv/
+.agents/
+.promts/
+__pycache__/
