@@ -1,7 +1,8 @@
 """Main application window and a consistent light theme."""
 
-from PySide6.QtWidgets import QMainWindow, QTabWidget
+from PySide6.QtWidgets import QMainWindow, QScrollArea, QTabWidget
 
+from calc_engine import DirectMeasurementResult, MeasurementValue
 from widgets.direct_tab import DirectMeasurementTab
 from widgets.indirect_tab import IndirectMeasurementTab
 
@@ -19,6 +20,13 @@ QLineEdit, QComboBox, QTextEdit { background: #fff; border: 1px solid #ccd7e5;
     border-radius: 5px; padding: 7px; selection-background-color: #d5e6ff; }
 QLineEdit:focus, QComboBox:focus { border: 1px solid #3478d4; }
 QLineEdit:read-only { background: #eef3fa; color: #55647a; }
+QComboBox { background-color: #ffffff; color: #24334b; }
+QComboBox::drop-down { background-color: #edf3fb; border-left: 1px solid #ccd7e5; width: 22px; }
+QComboBox QAbstractItemView { background-color: #ffffff; color: #24334b;
+    selection-background-color: #d5e6ff; selection-color: #24334b;
+    border: 1px solid #ccd7e5; outline: 0; }
+QComboBox QAbstractItemView::item { background-color: #ffffff; color: #24334b; min-height: 24px; }
+QComboBox QAbstractItemView::item:selected { background-color: #d5e6ff; color: #24334b; }
 QPushButton { background: #f1f5fa; border: 1px solid #ccd7e5; border-radius: 5px; padding: 9px 12px; }
 QPushButton:hover { background: #e2ecfa; }
 QPushButton#primary { background: #2866bd; color: white; border: none; font-weight: 600; }
@@ -33,11 +41,12 @@ QLabel#pageTitle { font-size: 20pt; font-weight: 600; padding: 8px 0; }
 QLabel#resultCard { background: #edf5ff; color: #174b8d; border: 1px solid #c7ddf9;
     border-radius: 7px; padding: 16px; font-size: 15pt; font-weight: 600; }
 QScrollArea { border: none; background: #f3f6fa; }
+QScrollArea > QWidget > QWidget { background: #f3f6fa; }
 """
 
 
 class MainWindow(QMainWindow):
-    """Connect the direct measurement registry to formula input bindings."""
+    """Share a session registry between direct and indirect calculations."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -48,8 +57,24 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.direct_tab = DirectMeasurementTab()
         self.indirect_tab = IndirectMeasurementTab()
+        self.indirect_scroll = QScrollArea()
+        self.indirect_scroll.setWidgetResizable(True)
+        self.indirect_scroll.setWidget(self.indirect_tab)
         self.tabs.addTab(self.direct_tab, "Прямые измерения")
-        self.tabs.addTab(self.indirect_tab, "Косвенные измерения")
-        self.direct_tab.results_changed.connect(self.indirect_tab.update_sources)
+        self.tabs.addTab(self.indirect_scroll, "Косвенные измерения")
+        self.saved_results: dict[str, tuple[str, DirectMeasurementResult | MeasurementValue]] = {}
+        self.direct_tab.results_changed.connect(self.save_direct_results)
+        self.indirect_tab.result_saved.connect(self.save_result)
         self.setCentralWidget(self.tabs)
-        self.statusBar().showMessage("Расчёты используют исходную точность; округление применяется только к итоговой записи.")
+        self.statusBar().showMessage("Прямые расчёты сохраняют точность. Округление источников косвенного расчёта выбирается на его вкладке.")
+
+    def save_direct_results(self, results: dict) -> None:
+        """Publish only newly calculated direct results into the common pool."""
+        for name, entry in results.items():
+            if entry[1] is self.direct_tab.result:
+                self.save_result(name, *entry)
+
+    def save_result(self, name: str, unit: str, result: DirectMeasurementResult | MeasurementValue) -> None:
+        """Replace the latest result for a symbol and refresh available sources."""
+        self.saved_results[name] = (unit, result)
+        self.indirect_tab.update_sources(self.saved_results)
