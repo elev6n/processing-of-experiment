@@ -1,23 +1,21 @@
 """Formula editing and propagation from manually entered or linked inputs."""
 
-from dataclasses import replace
-
-from PySide6.QtCore import QThreadPool, QTimer
+from PySide6.QtCore import QThreadPool, QTimer, Signal
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
+    QApplication, QCheckBox, QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
     QLineEdit, QPushButton, QScrollArea, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from calc_engine import (
-    DirectMeasurementResult, IndirectMeasurementResult, InvalidInputError,
-    calculate_indirect_measurement, formula_variables,
+    DirectMeasurementResult, IndirectMeasurementResult, InvalidInputError, MeasurementValue,
+    calculate_indirect_measurement, formula_variables, round_measurement,
 )
 from widgets.common import CalculationWorker, display, number, numeric_edit, result_text
 from widgets.error_dialog import ErrorDialog
 
 
 class VariableRow(QGroupBox):
-    """A single formula input with optional binding to a direct result."""
+    """A single formula input with optional binding to a saved result."""
 
     def __init__(self, name: str, parent: QWidget | None = None) -> None:
         super().__init__(name, parent)
@@ -37,10 +35,12 @@ class VariableRow(QGroupBox):
 class IndirectMeasurementTab(QWidget):
     """Discover formula variables and calculate independent error propagation."""
 
+    result_saved = Signal(str, str, object)
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.rows: dict[str, VariableRow] = {}
-        self.saved_results: dict[str, tuple[str, DirectMeasurementResult]] = {}
+        self.saved_results: dict[str, tuple[str, DirectMeasurementResult | MeasurementValue]] = {}
         self.result: IndirectMeasurementResult | None = None
         self.revision = 0
         self.parse_revision = 0
@@ -69,6 +69,11 @@ class IndirectMeasurementTab(QWidget):
         hint = QLabel("Степень: ^ или **. Функции: sqrt, sin, cos, tan, asin, acos, atan, exp, log, ln, lg, abs. Константы: pi, E.\nПогрешности независимы. При работе с разными единицами приведите значения к согласованной системе.")
         hint.setWordWrap(True)
         layout.addWidget(hint)
+        self.round_sources = QCheckBox("Использовать округлённые значения сохранённых величин")
+        self.round_sources.setChecked(True)
+        self.round_sources.setToolTip("Среднее и погрешность округляются как в итоговой карточке. Ручной ввод используется без изменений.")
+        self.round_sources.toggled.connect(self.refresh_sources)
+        layout.addWidget(self.round_sources)
         self.parse_status = QLabel("Введите формулу — поля переменных появятся автоматически.")
         self.parse_status.setWordWrap(True)
         layout.addWidget(self.parse_status)
@@ -98,6 +103,17 @@ class IndirectMeasurementTab(QWidget):
         self.formula_output.setMinimumHeight(80)
         self.formula_output.setMaximumHeight(90)
         output.addWidget(self.formula_output)
+        self.steps_toggle = QPushButton("Показать ход расчёта / формулы подстановки")
+        self.steps_toggle.setCheckable(True)
+        self.steps_toggle.setEnabled(False)
+        self.steps_toggle.toggled.connect(self.toggle_steps)
+        output.addWidget(self.steps_toggle)
+        self.steps_output = QTextEdit()
+        self.steps_output.setReadOnly(True)
+        self.steps_output.setMinimumHeight(100)
+        self.steps_output.setMaximumHeight(180)
+        self.steps_output.hide()
+        output.addWidget(self.steps_output)
         copy_row = QHBoxLayout()
         self.copy_text = QPushButton("Скопировать текст")
         self.copy_latex = QPushButton("Скопировать LaTeX")
@@ -126,6 +142,9 @@ class IndirectMeasurementTab(QWidget):
         self.result = None
         self.card.setText("Данные изменены. Нажмите «Рассчитать».")
         self.formula_output.clear()
+        self.steps_output.clear()
+        self.steps_toggle.setChecked(False)
+        self.steps_toggle.setEnabled(False)
         self.copy_text.setEnabled(False)
         self.copy_latex.setEnabled(False)
 
@@ -189,7 +208,7 @@ class IndirectMeasurementTab(QWidget):
             self.calculate_button.setEnabled(True if self.worker is None else False)
 
     def populate_source(self, row: VariableRow) -> None:
-        """Refresh available direct results preserving the selected source."""
+        """Refresh saved results preserving the selected source."""
         selected = row.source.currentData()
         row.source.blockSignals(True)
         row.source.clear()
@@ -201,14 +220,37 @@ class IndirectMeasurementTab(QWidget):
         row.source.blockSignals(False)
 
     def update_sources(self, results: dict) -> None:
-        """Refresh linked values whenever a direct result is calculated again."""
-        self.saved_results = results
+        """Refresh changed bindings, keeping unrelated current output intact."""
+        previous = self.saved_results
+        self.saved_results = dict(results)
         for name, row in self.rows.items():
+            selected = row.source.currentData()
             self.populate_source(row)
-            self.apply_source(name)
+            if selected is not None and previous.get(selected) != results.get(selected):
+                self.apply_source(name)
+
+    def refresh_sources(self) -> None:
+        """Apply the selected precision mode to all linked fields."""
+        for name, row in self.rows.items():
+            if row.source.currentData() in self.saved_results:
+                self.apply_source(name)
+        self.invalidate()
+
+    def source_value(self, source: str) -> MeasurementValue:
+        """Return the exact pair displayed in a linked input field."""
+        result = self.saved_results[source][1]
+        mean, error = result.mean, result.total_error
+        if self.round_sources.isChecked():
+            mean, error = round_measurement(mean, error)
+        return MeasurementValue(mean, error)
+
+    def toggle_steps(self, expanded: bool) -> None:
+        """Show the optional numerical derivation without filling the main screen."""
+        self.steps_output.setVisible(expanded)
+        self.steps_toggle.setText("Скрыть ход расчёта" if expanded else "Показать ход расчёта / формулы подстановки")
 
     def apply_source(self, name: str) -> None:
-        """Fill locked linked inputs with full precision from the engine result."""
+        """Fill locked linked inputs using the selected rounding mode."""
         row = self.rows[name]
         source = row.source.currentData()
         linked = source in self.saved_results
@@ -216,7 +258,8 @@ class IndirectMeasurementTab(QWidget):
         row.error.setReadOnly(linked)
         row.unit.clear()
         if linked:
-            unit, result = self.saved_results[source]
+            unit, _ = self.saved_results[source]
+            result = self.source_value(source)
             row.mean.setText(repr(result.mean))
             row.error.setText(repr(result.total_error))
             row.unit.setText(unit)
@@ -224,7 +267,7 @@ class IndirectMeasurementTab(QWidget):
 
     def inputs(self) -> dict:
         """Capture the formula and raw variable fields for diagnostics."""
-        return {"formula": self.formula.text(), "name": self.name.text(), "unit": self.unit.text(), "variables": {name: {"mean": row.mean.text(), "error": row.error.text(), "source": row.source.currentData()} for name, row in self.rows.items()}}
+        return {"formula": self.formula.text(), "name": self.name.text(), "unit": self.unit.text(), "round_sources": self.round_sources.isChecked(), "variables": {name: {"mean": row.mean.text(), "error": row.error.text(), "source": row.source.currentData()} for name, row in self.rows.items()}}
 
     def calculate(self) -> None:
         """Validate current fields and propagate uncertainties in the background."""
@@ -238,13 +281,12 @@ class IndirectMeasurementTab(QWidget):
             if not self.name.text().strip():
                 raise InvalidInputError("Укажите символ результата.")
             variables = {}
-            template = DirectMeasurementResult([], 1, 0, 0, 0, 0, 0, 0, 0, 0, [])
             for name, row in self.rows.items():
                 source = row.source.currentData()
                 if source in self.saved_results:
-                    variables[name] = self.saved_results[source][1]
+                    variables[name] = self.source_value(source)
                 else:
-                    variables[name] = replace(template, mean=number(row.mean.text(), f"{name}: среднее"), total_error=number(row.error.text(), f"{name}: погрешность", True))
+                    variables[name] = MeasurementValue(number(row.mean.text(), f"{name}: среднее"), number(row.error.text(), f"{name}: погрешность", True))
             self.pending = (self.revision, inputs)
             self.calculate_button.setEnabled(False)
             self.calculate_button.setText("Вычисление…")
@@ -271,10 +313,13 @@ class IndirectMeasurementTab(QWidget):
         self.finish()
         if self.pending[0] != self.revision:
             return
+        self.result_saved.emit(self.name.text().strip(), self.unit.text().strip(), MeasurementValue(result.value, result.total_error))
         self.result = result
         relative = f"ε = {display(result.relative_error_pct)} %" if result.value else "ε не определена при нулевом результате"
         self.card.setText(result_text(self.name.text().strip(), self.unit.text().strip(), result.value, result.total_error) + "\n" + relative)
         self.formula_output.setPlainText(f"F = {result.formula_latex}\n\n\\Delta F = {result.error_formula_latex}")
+        self.steps_output.setPlainText(result.calculation_steps)
+        self.steps_toggle.setEnabled(True)
         self.copy_text.setEnabled(True)
         self.copy_latex.setEnabled(True)
 
