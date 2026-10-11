@@ -12,6 +12,7 @@ from calc_engine import (
 )
 from widgets.common import CalculationWorker, display, number, numeric_edit, result_text
 from widgets.error_dialog import ErrorDialog
+from widgets.unit_selector import UnitSelector, bind_si_hint
 
 
 class VariableRow(QGroupBox):
@@ -23,13 +24,16 @@ class VariableRow(QGroupBox):
         self.error = numeric_edit(nonnegative=True)
         self.source = QComboBox()
         self.source.addItem("Ввести вручную", None)
-        self.unit = QLabel()
+        self.unit = UnitSelector()
+        self.si_hint = QLabel()
         form = QHBoxLayout(self)
         for label, widget in [("Источник", self.source), ("Среднее x̄", self.mean), ("Погрешность Δx", self.error)]:
             column = QFormLayout()
             column.addRow(label, widget)
             form.addLayout(column)
         form.addWidget(self.unit)
+        form.addWidget(self.si_hint)
+        bind_si_hint(self.mean, self.error, self.unit, self.si_hint)
 
 
 class IndirectMeasurementTab(QWidget):
@@ -60,13 +64,17 @@ class IndirectMeasurementTab(QWidget):
         self.formula.setPlaceholderText("Например: m * v^2 / 2")
         self.formula.setMaxLength(1000)
         self.name = QLineEdit("F")
-        self.unit = QLineEdit()
-        self.unit.setPlaceholderText("Например: Дж")
+        self.unit = UnitSelector()
+        self.unit.setPlaceholderText("Автоматически по формуле")
+        self.derived_units = QCheckBox("Использовать названия производных единиц (Дж, Н, Па…)")
+        self.derived_units.setChecked(True)
+        self.derived_units.toggled.connect(self.invalidate)
         form.addRow("F =", self.formula)
         form.addRow("Символ результата", self.name)
         form.addRow("Единица результата", self.unit)
+        form.addRow(self.derived_units)
         layout.addWidget(settings)
-        hint = QLabel("Степень: ^ или **. Функции: sqrt, sin, cos, tan, asin, acos, atan, exp, log, ln, lg, abs. Константы: pi, E.\nПогрешности независимы. При работе с разными единицами приведите значения к согласованной системе.")
+        hint = QLabel("Степень: ^ или **. Функции: sqrt, sin, cos, tan, asin, acos, atan, exp, log, ln, lg, abs. Константы: pi, E.\nВыберите единицы переменных. Значения и погрешности автоматически переводятся в СИ; единица результата определяется формулой.")
         hint.setWordWrap(True)
         layout.addWidget(hint)
         self.round_sources = QCheckBox("Использовать округлённые значения сохранённых величин")
@@ -194,6 +202,7 @@ class IndirectMeasurementTab(QWidget):
                 self.variable_layout.insertWidget(self.variable_layout.count() - 1, row)
                 row.mean.textChanged.connect(self.invalidate)
                 row.error.textChanged.connect(self.invalidate)
+                row.unit.textChanged.connect(self.invalidate)
                 row.source.currentIndexChanged.connect(lambda _index, key=name: self.apply_source(key))
                 self.populate_source(row)
         self.parsed_formula = self.normalized_formula()
@@ -242,7 +251,7 @@ class IndirectMeasurementTab(QWidget):
         mean, error = result.mean, result.total_error
         if self.round_sources.isChecked():
             mean, error = round_measurement(mean, error)
-        return MeasurementValue(mean, error)
+        return MeasurementValue(mean, error, self.saved_results[source][0])
 
     def toggle_steps(self, expanded: bool) -> None:
         """Show the optional numerical derivation without filling the main screen."""
@@ -256,6 +265,7 @@ class IndirectMeasurementTab(QWidget):
         linked = source in self.saved_results
         row.mean.setReadOnly(linked)
         row.error.setReadOnly(linked)
+        row.unit.setEnabled(not linked)
         row.unit.clear()
         if linked:
             unit, _ = self.saved_results[source]
@@ -267,7 +277,7 @@ class IndirectMeasurementTab(QWidget):
 
     def inputs(self) -> dict:
         """Capture the formula and raw variable fields for diagnostics."""
-        return {"formula": self.formula.text(), "name": self.name.text(), "unit": self.unit.text(), "round_sources": self.round_sources.isChecked(), "variables": {name: {"mean": row.mean.text(), "error": row.error.text(), "source": row.source.currentData()} for name, row in self.rows.items()}}
+        return {"formula": self.formula.text(), "name": self.name.text(), "unit": self.unit.text(), "round_sources": self.round_sources.isChecked(), "variables": {name: {"mean": row.mean.text(), "error": row.error.text(), "unit": row.unit.text(), "source": row.source.currentData()} for name, row in self.rows.items()}}
 
     def calculate(self) -> None:
         """Validate current fields and propagate uncertainties in the background."""
@@ -286,11 +296,13 @@ class IndirectMeasurementTab(QWidget):
                 if source in self.saved_results:
                     variables[name] = self.source_value(source)
                 else:
-                    variables[name] = MeasurementValue(number(row.mean.text(), f"{name}: среднее"), number(row.error.text(), f"{name}: погрешность", True))
+                    variables[name] = MeasurementValue(number(row.mean.text(), f"{name}: среднее"), number(row.error.text(), f"{name}: погрешность", True), row.unit.text())
             self.pending = (self.revision, inputs)
             self.calculate_button.setEnabled(False)
             self.calculate_button.setText("Вычисление…")
-            self.worker = CalculationWorker(lambda: calculate_indirect_measurement(formula, variables))
+            result_unit = self.unit.text()
+            derived = self.derived_units.isChecked()
+            self.worker = CalculationWorker(lambda: calculate_indirect_measurement(formula, variables, result_unit, derived))
             self.worker.signals.succeeded.connect(self.show_result)
             self.worker.signals.failed.connect(self.calculation_failed)
             QThreadPool.globalInstance().start(self.worker)
@@ -313,10 +325,10 @@ class IndirectMeasurementTab(QWidget):
         self.finish()
         if self.pending[0] != self.revision:
             return
-        self.result_saved.emit(self.name.text().strip(), self.unit.text().strip(), MeasurementValue(result.value, result.total_error))
+        self.result_saved.emit(self.name.text().strip(), result.unit, MeasurementValue(result.value, result.total_error, result.unit))
         self.result = result
         relative = f"ε = {display(result.relative_error_pct)} %" if result.value else "ε не определена при нулевом результате"
-        self.card.setText(result_text(self.name.text().strip(), self.unit.text().strip(), result.value, result.total_error) + "\n" + relative)
+        self.card.setText(result_text(self.name.text().strip(), result.unit, result.value, result.total_error) + "\n" + relative)
         self.formula_output.setPlainText(f"F = {result.formula_latex}\n\n\\Delta F = {result.error_formula_latex}")
         self.steps_output.setPlainText(result.calculation_steps)
         self.steps_toggle.setEnabled(True)
@@ -326,7 +338,7 @@ class IndirectMeasurementTab(QWidget):
     def copy_result(self, latex: bool) -> None:
         """Copy either the final text or final result and uncertainty formula in LaTeX."""
         if self.result:
-            text = result_text(self.name.text().strip(), self.unit.text().strip(), self.result.value, self.result.total_error, latex)
+            text = result_text(self.name.text().strip(), self.result.unit, self.result.value, self.result.total_error, latex)
             if latex:
                 text += f"\n\\Delta F = {self.result.error_formula_latex}"
             QApplication.clipboard().setText(text)

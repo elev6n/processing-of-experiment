@@ -22,6 +22,8 @@ import sympy as sp
 from scipy.stats import t
 from sympy.parsing.sympy_parser import parse_expr
 
+from units_engine import InvalidUnitError, Quantity, format_dimension, formula_dimension, parse_unit
+
 
 class InvalidInputError(ValueError):
     """Input data violate the measurement API's constraints."""
@@ -37,7 +39,7 @@ class MathDomainError(ArithmeticError):
 
 @dataclass
 class DirectMeasurementResult:
-    """Unrounded direct result and per-observation table, with errors in input units."""
+    """Unrounded direct result and per-observation table in SI, with unit metadata."""
 
     raw_data: list[float]
     n: int
@@ -50,6 +52,7 @@ class DirectMeasurementResult:
     total_error: float
     relative_error_pct: float
     table_rows: list[dict[str, float]]
+    unit: str = ""
 
 
 @dataclass
@@ -58,6 +61,7 @@ class MeasurementValue:
 
     mean: float
     total_error: float
+    unit: str = ""
 
 
 @dataclass
@@ -71,6 +75,7 @@ class UnequalMeasurementResult:
     weights: list[float]
     contributions: list[float]
     calculation_steps: str = ""
+    unit: str = ""
 
 
 @dataclass
@@ -86,6 +91,7 @@ class IndirectMeasurementResult:
     partials_eval: dict[str, float]
     calculation_steps: str = ""
     input_values: dict[str, MeasurementValue] = field(default_factory=dict)
+    unit: str = ""
 
 
 def _input_number(value: Any, name: str) -> float:
@@ -119,6 +125,7 @@ def _relative_error(value: float, error: float) -> float:
 
 def calculate_unequal_measurements(
     series_list: Sequence[MeasurementValue | DirectMeasurementResult],
+    unit: str | None = None,
 ) -> UnequalMeasurementResult:
     """Combine series using inverse squared absolute uncertainties.
 
@@ -138,6 +145,7 @@ def calculate_unequal_measurements(
         raise InvalidInputError("Добавьте хотя бы одну серию измерений.")
     series = []
     weights = []
+    dimensions = []
     for index, entry in enumerate(series_list, 1):
         if not isinstance(entry, (MeasurementValue, DirectMeasurementResult)):
             raise InvalidInputError(f"Серия {index}: требуется среднее и абсолютная погрешность.")
@@ -145,12 +153,19 @@ def calculate_unequal_measurements(
         error = _input_number(entry.total_error, f"Серия {index}: погрешность")
         if error <= 0:
             raise InvalidInputError(f"Серия {index}: абсолютная погрешность должна быть строго больше нуля.")
+        dimensions.append(parse_unit(entry.unit).dimension)
+        mean = Quantity(mean, entry.unit).to_si()
+        error = Quantity(error, entry.unit).to_si()
         # Avoid squaring the uncertainty before inversion (which may overflow).
         weight = _real((1.0 / error) * (1.0 / error), f"Вес серии {index}")
         if weight == 0:
             raise MathDomainError(f"Вес серии {index} слишком мал для численного представления.")
-        series.append(MeasurementValue(mean, error))
+        series.append(MeasurementValue(mean, error, format_dimension(dimensions[-1])))
         weights.append(weight)
+    if any(dimension != dimensions[0] for dimension in dimensions):
+        raise InvalidUnitError("Серии должны измерять величину одной размерности.")
+    if unit and parse_unit(unit).dimension != dimensions[0]:
+        raise InvalidUnitError("Единица результата не соответствует размерности серий.")
     minimum_error = min(entry.total_error for entry in series)
     scaled_weights = [(minimum_error / entry.total_error) ** 2 for entry in series]
     scaled_sum = math.fsum(scaled_weights)
@@ -164,6 +179,7 @@ def calculate_unequal_measurements(
     error = minimum_error / math.sqrt(scaled_sum)
     result = UnequalMeasurementResult(mean, error, _relative_error(mean, error), series, weights, contributions)
     result.calculation_steps = _unequal_calculation_steps(result)
+    result.unit = format_dimension(dimensions[0]) if any(entry.unit for entry in series_list) else ""
     return result
 
 
@@ -200,14 +216,15 @@ def _unequal_calculation_steps(result: UnequalMeasurementResult) -> str:
 
 
 def calculate_direct_measurement(
-    measurements: Sequence[float], theta: float, alpha: float = 0.95
+    measurements: Sequence[float], theta: float, alpha: float = 0.95, unit: str = ""
 ) -> DirectMeasurementResult:
     """Calculate the mean and combined uncertainty of repeated measurements.
 
     Args:
-        measurements: Nonempty one-dimensional collection of finite real values.
-        theta: Nonnegative absolute instrumental uncertainty.
+        measurements: Nonempty one-dimensional collection in the input unit.
+        theta: Nonnegative absolute instrumental uncertainty in the same unit.
         alpha: Confidence probability strictly between zero and one.
+        unit: Registered or compound input unit; empty means dimensionless.
 
     Returns:
         Unrounded result. For one observation the Student coefficient and random
@@ -231,6 +248,9 @@ def calculate_direct_measurement(
     n = len(raw_data)
     if not n:
         raise InvalidInputError("At least one measurement is required.")
+    parsed_unit = parse_unit(unit)
+    raw_data = [Quantity(value, unit).to_si() for value in raw_data]
+    theta = Quantity(theta, unit).to_si()
     data = np.asarray(raw_data, dtype=float)
     with np.errstate(over="ignore", invalid="ignore"):
         mean = _real(data[0] if np.all(data == data[0]) else np.sum(data / n), "Mean")
@@ -249,6 +269,7 @@ def calculate_direct_measurement(
     return DirectMeasurementResult(
         raw_data, n, mean, std_error, std_error, coefficient, random_error,
         theta, total_error, _relative_error(mean, total_error), rows,
+        format_dimension(parsed_unit.dimension) if unit else "",
     )
 
 
@@ -347,14 +368,17 @@ def _evaluate_formula(node: ast.AST, values: dict[str, float]) -> float:
 
 
 def calculate_indirect_measurement(
-    formula_str: str, variables_data: Mapping[str, DirectMeasurementResult | MeasurementValue]
+    formula_str: str, variables_data: Mapping[str, DirectMeasurementResult | MeasurementValue],
+    unit: str | None = None, derived_units: bool = True,
 ) -> IndirectMeasurementResult:
     """Propagate independent absolute uncertainties through a real scalar formula.
 
     Args:
         formula_str: Python arithmetic using ** for powers; supports sqrt, sin,
             cos, tan, asin, acos, atan, exp, log/ln, lg, abs and constants pi/E.
-        variables_data: Variable names mapped to scalar results (mean, total_error).
+        variables_data: Scalar results with input units; values and errors are converted to SI.
+        unit: Optional expected result unit, used to validate the inferred dimension.
+        derived_units: Display known derived symbols instead of SI base products.
 
     Returns:
         Function value, propagated uncertainty, evaluated partials and LaTeX.
@@ -383,12 +407,18 @@ def calculate_indirect_measurement(
         errors[name] = _input_number(result.total_error, f"{name}.total_error")
         if errors[name] < 0:
             raise InvalidInputError(f"{name}.total_error must be nonnegative.")
+        means[name] = Quantity(means[name], result.unit).to_si()
+        errors[name] = Quantity(errors[name], result.unit).to_si()
         symbols[name] = sp.Symbol(name, real=True)
     try:
         tree = ast.parse(formula_str.strip(), mode="eval").body
     except (SyntaxError, ValueError) as exc:
         raise FormulaParseError("Invalid formula syntax.") from exc
     _validate_formula(tree, set(symbols) | set(_CONSTANTS))
+    dimension = formula_dimension(formula_str, {name: result.unit for name, result in variables_data.items()})
+    if unit and parse_unit(unit).dimension != dimension:
+        raise InvalidUnitError(f"Единица результата «{unit}» не соответствует {format_dimension(dimension)}.")
+    result_unit = format_dimension(dimension, derived_units) if unit or any(result.unit for result in variables_data.values()) else ""
     local_dict = {**_FUNCTIONS, **_CONSTANTS, **symbols}
     try:
         expression = parse_expr(
@@ -430,7 +460,8 @@ def calculate_indirect_measurement(
     return IndirectMeasurementResult(
         formula_str, value, total_error, _relative_error(value, total_error),
         sp.latex(expression), sp.latex(sp.sqrt(sp.Add(*symbolic_terms))), partials,
-        "\n".join(steps), {name: MeasurementValue(means[name], errors[name]) for name in means},
+        "\n".join(steps), {name: MeasurementValue(means[name], errors[name], format_dimension(parse_unit(variables_data[name].unit).dimension)) for name in means},
+        result_unit,
     )
 
 

@@ -133,11 +133,12 @@ def direct_result(app, window):
 def test_notebook_table_and_invalidation(app, window):
     result = direct_result(app, window)
     tab = window.direct_tab
-    assert result.mean == pytest.approx(19.89)
+    assert result.mean == pytest.approx(0.01989)
     assert tab.output_table.rowCount() == 5
     assert tab.output_table.rowSpan(0, 4) == 5
-    assert tab.output_table.item(2, 3).text() == "0,0004"
-    assert "19,890 ± 0,019" in tab.card.text()
+    assert float(tab.output_table.item(2, 3).text().replace(",", ".")) == pytest.approx(4e-10)
+    assert "м" in tab.card.text()
+    assert result.unit == "м"
     tab.copy_result(True)
     assert r"\pm" in QApplication.clipboard().text()
     tab.table.setItem(0, 1, QTableWidgetItem("20"))
@@ -156,12 +157,12 @@ def test_linked_indirect_inputs_refresh_and_selected_precision(app, window, roun
     row = tab.rows["d"]
     row.source.setCurrentIndex(row.source.findData("d"))
     assert row.mean.isReadOnly()
-    assert float(row.mean.text()) == window.direct_tab.result.mean
+    assert float(row.mean.text()) == (round_measurement(window.direct_tab.result.mean, window.direct_tab.result.total_error)[0] if rounded else window.direct_tab.result.mean)
     tab.calculate()
     until(app, lambda: tab.result is not None)
-    assert tab.result.value == pytest.approx(19.89**2 / 2)
+    assert tab.result.value == pytest.approx(0.01989**2 / 2)
     error = window.direct_tab.result.total_error
-    assert tab.result.total_error == pytest.approx(19.89 * (0.019 if rounded else error))
+    assert tab.result.total_error == pytest.approx(0.01989 * (0.000019 if rounded else error))
     window.direct_tab.table.setItem(0, 1, QTableWidgetItem("20"))
     window.direct_tab.calculate()
     until(app, lambda: window.direct_tab.result is not None)
@@ -181,6 +182,7 @@ def test_notebook_rounding_steps_and_chained_pool(app, window):
     until(app, lambda: tab.parsed_formula == "S/t")
     tab.rows["S"].mean.setText("0.422")
     tab.rows["S"].error.setText("0.001")
+    tab.rows["S"].unit.setText("м")
     tab.rows["t"].source.setCurrentIndex(tab.rows["t"].source.findData("t"))
     assert tab.rows["t"].mean.text() == "2.58"
     assert tab.rows["t"].error.text() == "0.22"
@@ -207,6 +209,7 @@ def test_notebook_rounding_steps_and_chained_pool(app, window):
     tab.round_sources.setChecked(True)
 
     tab.name.setText("K")
+    tab.unit.setText("")
     tab.formula.setText("V**2/2")
     until(app, lambda: tab.parsed_formula == "V**2/2")
     row = tab.rows["V"]
@@ -403,6 +406,7 @@ def test_unequal_indirect_sources_precision_and_steps(app, window, rounded):
     for name, mean, error in [("eta_1", 1.23456789, 0.0123456789), ("eta_2", 2.34567891, 0.0234567891)]:
         indirect.name.setText(name)
         indirect.unit.setText("Па·с")
+        indirect.rows["x"].unit.setText("Па·с")
         indirect.rows["x"].mean.setText(repr(mean))
         indirect.rows["x"].error.setText(repr(error))
         indirect.calculate()
@@ -458,6 +462,7 @@ def test_unequal_precision_preserves_manual_input_and_refreshes_scalar_sources(a
     manual, linked = tab.rows
     manual.mean.setText("0,5123456789")
     manual.error.setText("0,05123456789")
+    manual.unit.setText("Па·с")
     linked.source.setCurrentIndex(linked.source.findData("eta_1"))
     tab.calculate()
     until(app, lambda: tab.result is not None)
@@ -497,3 +502,88 @@ def test_unequal_sources_reuse_combined_result(app, window):
     assert tab.result.mean == 0.394123456789
     assert tab.result.total_error == 0.026123456789
     assert {"eta_1", "eta"} <= window.saved_results.keys()
+
+
+def test_si_manual_energy_and_dimension_error_dialog(app, window, monkeypatch):
+    """Manual unit choices drive SI output and invalid sums publish nothing."""
+    messages = []
+    monkeypatch.setattr(ErrorDialog, "exec", lambda self: messages.append(self.informativeText()))
+    tab = window.indirect_tab
+    tab.formula.setText("m*v**2/2")
+    until(app, lambda: tab.parsed_formula == "m*v**2/2")
+    for name, mean, error, unit in [("m", "500", "5", "г"), ("v", "200", "2", "см/с")]:
+        row = tab.rows[name]
+        row.unit.setText(unit)
+        row.mean.setText(mean)
+        row.error.setText(error)
+    assert "0.5 кг" in tab.rows["m"].si_hint.text()
+    tab.calculate()
+    until(app, lambda: tab.result is not None)
+    assert tab.result.value == pytest.approx(1)
+    assert window.saved_results["F"][0] == "Дж"
+    tab.copy_result(False)
+    assert "Дж" in QApplication.clipboard().text()
+    tab.formula.setText("m+v")
+    until(app, lambda: tab.parsed_formula == "m+v")
+    tab.calculate()
+    until(app, lambda: bool(messages))
+    assert "Нельзя складывать" in messages[-1]
+    assert tab.result is None
+    assert window.saved_results["F"][0] == "Дж"
+
+
+def test_si_direct_source_reuse_and_plot_conversion(app, window):
+    """SI memory is reused once, and plotting can request millimetres explicitly."""
+    from calc_engine import MeasurementValue
+
+    direct = window.direct_tab
+    direct.table.setRowCount(1)
+    direct.table.setItem(0, 1, QTableWidgetItem("25.4"))
+    direct.theta.setText("0.1")
+    direct.unit.setText("мм")
+    assert "0.0254 м" in direct.si_hint.text()
+    direct.calculate()
+    until(app, lambda: direct.result is not None)
+    assert window.saved_results["d"][0] == "м"
+    assert window.saved_results["d"][1].mean == pytest.approx(0.0254)
+    indirect = window.indirect_tab
+    indirect.round_sources.setChecked(False)
+    indirect.formula.setText("d*2")
+    until(app, lambda: indirect.parsed_formula == "d*2")
+    indirect.rows["d"].source.setCurrentIndex(indirect.rows["d"].source.findData("d"))
+    assert not indirect.rows["d"].unit.isEnabled()
+    indirect.calculate()
+    until(app, lambda: indirect.result is not None)
+    assert indirect.result.value == pytest.approx(0.0508)
+    assert indirect.result.total_error == pytest.approx(0.0002)
+    axis = window.least_squares_tab.x_input
+    axis.mode.setCurrentIndex(1)
+    axis.sources.item(0).setSelected(True)
+    axis.unit.setText("мм")
+    values, errors = axis.observations()
+    assert values == pytest.approx([25.4])
+    assert errors == pytest.approx([0.1])
+    window.save_result("other", "см", MeasurementValue(3, 0.01, "см"))
+    axis.sources.item(2).setSelected(True)
+    values, errors = axis.observations()
+    assert values == pytest.approx([25.4, 30])
+
+
+def test_si_unequal_manual_unit_conversion_and_error(app, window, monkeypatch):
+    """Series selectors allow differing prefixes and reject differing dimensions."""
+    messages = []
+    monkeypatch.setattr(ErrorDialog, "exec", lambda self: messages.append(self.informativeText()))
+    tab = window.unequal_tab
+    for row, mean, error, unit in zip(tab.rows, [1000, 102], [10, 2], ["мм", "см"]):
+        row.mean.setText(str(mean))
+        row.error.setText(str(error))
+        row.unit.setText(unit)
+    tab.calculate()
+    until(app, lambda: tab.result is not None)
+    assert tab.result.mean == pytest.approx(1.004)
+    assert window.saved_results["X"][0] == "м"
+    tab.rows[1].unit.setText("с")
+    assert tab.result is None
+    tab.calculate()
+    until(app, lambda: bool(messages))
+    assert "одной размерности" in messages[-1]

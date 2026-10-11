@@ -17,6 +17,7 @@ from calc_engine import DirectMeasurementResult, InvalidInputError, MeasurementV
 from least_squares import LeastSquaresResult, calculate_least_squares
 from widgets.common import CalculationWorker, display, number, result_text
 from widgets.error_dialog import ErrorDialog
+from units_engine import InvalidUnitError, parse_unit
 
 
 class AxisInput(QGroupBox):
@@ -98,19 +99,31 @@ class AxisInput(QGroupBox):
                 errors *= len(values)
             return values, errors
         values, errors = [], []
+        target = parse_unit(self.resolved_unit())
         for item in self.sources.selectedItems():
-            _, result = self.saved_results[item.data(Qt.ItemDataRole.UserRole)]
+            source_unit, result = self.saved_results[item.data(Qt.ItemDataRole.UserRole)]
+            source = parse_unit(source_unit)
+            if source.dimension != target.dimension:
+                raise InvalidUnitError("Точки одной оси должны иметь одинаковую размерность.")
+            factor = source.multiplier / target.multiplier
             if isinstance(result, DirectMeasurementResult):
-                values.extend(result.raw_data)
-                errors.extend([result.instr_error] * len(result.raw_data))
+                values.extend(value * factor for value in result.raw_data)
+                errors.extend([result.instr_error * factor] * len(result.raw_data))
             else:
-                values.append(result.mean)
-                errors.append(result.total_error)
+                values.append(result.mean * factor)
+                errors.append(result.total_error * factor)
         return values, errors
+
+    def resolved_unit(self) -> str:
+        """Use the explicit plotting unit or infer it from the first memory source."""
+        if self.unit.text().strip() or self.mode.currentIndex() == 0:
+            return self.unit.text().strip()
+        selected = self.sources.selectedItems()
+        return self.saved_results[selected[0].data(Qt.ItemDataRole.UserRole)][0] if selected else ""
 
     def axis_label(self) -> str:
         """Combine the user label and unit without enabling external TeX."""
-        return ", ".join(part for part in (self.label.text().strip(), self.unit.text().strip()) if part)
+        return ", ".join(part for part in (self.label.text().strip(), self.resolved_unit()) if part)
 
 
 class LeastSquaresTab(QWidget):
@@ -203,7 +216,7 @@ class LeastSquaresTab(QWidget):
             return
         self.invalidate()
         revision = self.revision
-        units = (self.x_input.unit.text().strip(), self.y_input.unit.text().strip())
+        units = (self.x_input.resolved_unit(), self.y_input.resolved_unit())
         labels = (self.x_input.axis_label(), self.y_input.axis_label())
         self.calculate_button.setEnabled(False)
         self.worker = CalculationWorker(lambda: calculate_least_squares(x, y, dx, dy))
@@ -226,8 +239,8 @@ class LeastSquaresTab(QWidget):
                 f"{result_text(names[1], units[1], result.b, result.delta_b)}\n"
                 f"r Пирсона = {r}; остаточная дисперсия = {display(result.residual_variance)}"
             )
-            self.result_saved.emit(names[0], k_unit, MeasurementValue(result.k, result.delta_k))
-            self.result_saved.emit(names[1], units[1], MeasurementValue(result.b, result.delta_b))
+            self.result_saved.emit(names[0], k_unit, MeasurementValue(result.k, result.delta_k, k_unit))
+            self.result_saved.emit(names[1], units[1], MeasurementValue(result.b, result.delta_b, units[1]))
             # Publishing may invalidate this fit if it replaces a selected input.
             if revision == self.revision:
                 self.result = result
