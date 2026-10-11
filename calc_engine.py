@@ -12,7 +12,7 @@ import ast
 import math
 import operator
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_HALF_UP, localcontext
 from numbers import Real
 from typing import Any
@@ -53,6 +53,14 @@ class DirectMeasurementResult:
 
 
 @dataclass
+class MeasurementValue:
+    """A reusable scalar value and its independent absolute uncertainty."""
+
+    mean: float
+    total_error: float
+
+
+@dataclass
 class IndirectMeasurementResult:
     """Unrounded function value, independent-error propagation and LaTeX formulas."""
 
@@ -63,6 +71,8 @@ class IndirectMeasurementResult:
     formula_latex: str
     error_formula_latex: str
     partials_eval: dict[str, float]
+    calculation_steps: str = ""
+    input_values: dict[str, MeasurementValue] = field(default_factory=dict)
 
 
 def _input_number(value: Any, name: str) -> float:
@@ -242,14 +252,14 @@ def _evaluate_formula(node: ast.AST, values: dict[str, float]) -> float:
 
 
 def calculate_indirect_measurement(
-    formula_str: str, variables_data: Mapping[str, DirectMeasurementResult]
+    formula_str: str, variables_data: Mapping[str, DirectMeasurementResult | MeasurementValue]
 ) -> IndirectMeasurementResult:
     """Propagate independent absolute uncertainties through a real scalar formula.
 
     Args:
         formula_str: Python arithmetic using ** for powers; supports sqrt, sin,
             cos, tan, asin, acos, atan, exp, log/ln, lg, abs and constants pi/E.
-        variables_data: Variable names mapped to direct results (mean, total_error).
+        variables_data: Variable names mapped to scalar results (mean, total_error).
 
     Returns:
         Function value, propagated uncertainty, evaluated partials and LaTeX.
@@ -272,8 +282,8 @@ def calculate_indirect_measurement(
             or name in _FUNCTIONS or name in _CONSTANTS
         ):
             raise InvalidInputError(f"Invalid or reserved variable name: {name!r}.")
-        if not isinstance(result, DirectMeasurementResult):
-            raise InvalidInputError(f"{name} must contain a DirectMeasurementResult.")
+        if not isinstance(result, (DirectMeasurementResult, MeasurementValue)):
+            raise InvalidInputError(f"{name} must contain a measurement result.")
         means[name] = _input_number(result.mean, f"{name}.mean")
         errors[name] = _input_number(result.total_error, f"{name}.total_error")
         if errors[name] < 0:
@@ -297,15 +307,35 @@ def calculate_indirect_measurement(
     partials: dict[str, float] = {}
     contributions: list[float] = []
     symbolic_terms: list[sp.Expr] = []
+    steps = ["Подстановка средних значений:", f"F = {formula_str}"]
+
+    class SubstituteMeans(ast.NodeTransformer):
+        """Keep the original operations visible, including cancelled variables."""
+
+        def visit_Name(self, node: ast.Name) -> ast.AST:
+            if node.id in means:
+                return ast.copy_location(ast.Constant(means[node.id]), node)
+            return node
+
+    numeric_tree = SubstituteMeans().visit(ast.parse(formula_str.strip(), mode="eval"))
+    steps.append(f"F = {ast.unparse(numeric_tree)} = {value:.12g}")
+    steps.extend(["", "Частные производные и вклады погрешностей:"])
     for name, symbol in symbols.items():
         derivative = sp.diff(expression, symbol)
         partials[name] = _real(derivative.subs(substitutions), f"Derivative for {name}")
         contributions.append(_real(partials[name] * errors[name], f"Uncertainty for {name}"))
         symbolic_terms.append((derivative * sp.Symbol(f"Delta_{name}", nonnegative=True)) ** 2)
+        steps.append(
+            f"∂F/∂{name} = {derivative}; при {means}: {partials[name]:.12g}\n"
+            f"Δ{name} = {errors[name]:.12g}; вклад = ({partials[name]:.12g} × {errors[name]:.12g})²"
+        )
     total_error = _real(math.hypot(*contributions), "Propagated uncertainty")
+    terms = " + ".join(f"({partials[name]:.12g} × {errors[name]:.12g})²" for name in symbols) or "0"
+    steps.extend(["", f"ΔF = √({terms}) = {total_error:.12g}"])
     return IndirectMeasurementResult(
         formula_str, value, total_error, _relative_error(value, total_error),
         sp.latex(expression), sp.latex(sp.sqrt(sp.Add(*symbolic_terms))), partials,
+        "\n".join(steps), {name: MeasurementValue(means[name], errors[name]) for name in means},
     )
 
 
