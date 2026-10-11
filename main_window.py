@@ -5,6 +5,7 @@ from PySide6.QtWidgets import QMainWindow, QScrollArea, QTabWidget
 from calc_engine import DirectMeasurementResult, MeasurementValue
 from widgets.direct_tab import DirectMeasurementTab
 from widgets.indirect_tab import IndirectMeasurementTab
+from widgets.unequal_tab import UnequalMeasurementTab
 
 
 STYLE_SHEET = """
@@ -46,7 +47,7 @@ QScrollArea > QWidget > QWidget { background: #f3f6fa; }
 
 
 class MainWindow(QMainWindow):
-    """Share a session registry between direct and indirect calculations."""
+    """Share a session registry between all measurement calculations."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -62,11 +63,17 @@ class MainWindow(QMainWindow):
         self.indirect_scroll.setWidget(self.indirect_tab)
         self.tabs.addTab(self.direct_tab, "Прямые измерения")
         self.tabs.addTab(self.indirect_scroll, "Косвенные измерения")
+        self.unequal_tab = UnequalMeasurementTab()
+        self.unequal_scroll = QScrollArea()
+        self.unequal_scroll.setWidgetResizable(True)
+        self.unequal_scroll.setWidget(self.unequal_tab)
+        self.tabs.addTab(self.unequal_scroll, "Неравноточные измерения")
         self.saved_results: dict[str, tuple[str, DirectMeasurementResult | MeasurementValue]] = {}
         self.direct_tab.results_changed.connect(self.save_direct_results)
         self.indirect_tab.result_saved.connect(self.save_result)
+        self.unequal_tab.result_saved.connect(self.save_result)
         self.setCentralWidget(self.tabs)
-        self.statusBar().showMessage("Прямые расчёты сохраняют точность. Округление источников косвенного расчёта выбирается на его вкладке.")
+        self.statusBar().showMessage("Прямые расчёты сохраняют точность. Округление источников выбирается на вкладках косвенных и неравноточных измерений.")
 
     def save_direct_results(self, results: dict) -> None:
         """Publish only newly calculated direct results into the common pool."""
@@ -78,3 +85,4 @@ class MainWindow(QMainWindow):
         """Replace the latest result for a symbol and refresh available sources."""
         self.saved_results[name] = (unit, result)
         self.indirect_tab.update_sources(self.saved_results)
+        self.unequal_tab.update_sources(self.saved_results)
