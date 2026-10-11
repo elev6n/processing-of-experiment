@@ -5,6 +5,7 @@ from PySide6.QtWidgets import QMainWindow, QScrollArea, QTabWidget
 from calc_engine import DirectMeasurementResult, MeasurementValue
 from widgets.direct_tab import DirectMeasurementTab
 from widgets.indirect_tab import IndirectMeasurementTab
+from widgets.least_squares_tab import LeastSquaresTab
 from widgets.unequal_tab import UnequalMeasurementTab
 
 
@@ -68,10 +69,16 @@ class MainWindow(QMainWindow):
         self.unequal_scroll.setWidgetResizable(True)
         self.unequal_scroll.setWidget(self.unequal_tab)
         self.tabs.addTab(self.unequal_scroll, "Неравноточные измерения")
+        self.least_squares_tab = LeastSquaresTab()
+        self.least_squares_scroll = QScrollArea()
+        self.least_squares_scroll.setWidgetResizable(True)
+        self.least_squares_scroll.setWidget(self.least_squares_tab)
+        self.tabs.addTab(self.least_squares_scroll, "Метод наименьших квадратов")
         self.saved_results: dict[str, tuple[str, DirectMeasurementResult | MeasurementValue]] = {}
         self.direct_tab.results_changed.connect(self.save_direct_results)
         self.indirect_tab.result_saved.connect(self.save_result)
         self.unequal_tab.result_saved.connect(self.save_result)
+        self.least_squares_tab.result_saved.connect(self.save_result)
         self.setCentralWidget(self.tabs)
         self.statusBar().showMessage("Прямые расчёты сохраняют точность. Округление источников выбирается на вкладках косвенных и неравноточных измерений.")
 
@@ -86,3 +93,4 @@ class MainWindow(QMainWindow):
         self.saved_results[name] = (unit, result)
         self.indirect_tab.update_sources(self.saved_results)
         self.unequal_tab.update_sources(self.saved_results)
+        self.least_squares_tab.update_sources(self.saved_results)

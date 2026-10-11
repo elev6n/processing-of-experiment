@@ -44,12 +44,13 @@ def main() -> None:
         "--specpath", str(ROOT / "build"),
         "--paths", str(ROOT),
     ]
-    for module in ("scipy.stats", "scipy.special", "sympy.parsing.sympy_parser"):
+    for module in ("scipy.stats", "scipy.special", "sympy.parsing.sympy_parser", "matplotlib.backends.backend_qtagg"):
         command.extend(["--hidden-import", module])
     # Standard hooks collect .pyd extensions and adjacent numpy/scipy .libs DLLs.
     for package in ("numpy", "scipy"):
         command.extend(["--collect-binaries", package])
-    for module in ("tkinter", "matplotlib", "IPython", "pytest", "PyQt5", "PyQt6", "PySide2"):
+    command.extend(["--collect-data", "matplotlib"])
+    for module in ("tkinter", "IPython", "pytest", "PyQt5", "PyQt6", "PySide2"):
         command.extend(["--exclude-module", module])
     # Keep Qt's package-relative plugin layout for the PySide6 runtime hook.
     for group in ("platforms", "styles"):

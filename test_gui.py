@@ -15,6 +15,81 @@ from widgets.common import result_text
 from widgets.error_dialog import ErrorDialog
 
 
+def test_least_squares_plot_memory_and_export(app, window, monkeypatch, tmp_path):
+    """Exercise comma input, error bars, coefficient reuse and both export formats."""
+    from PySide6.QtWidgets import QFileDialog
+    from calc_engine import calculate_indirect_measurement
+
+    tab = window.least_squares_tab
+    tab.x_input.values.setPlainText("0; 1; 2; 3")
+    tab.y_input.values.setPlainText("1,1\n3,0\n5,2\n6,9")
+    tab.x_input.errors.setText("0,1")
+    tab.y_input.errors.setText("0,2 0,3 0,2 0,3")
+    tab.x_input.label.setText("Время $t$")
+    tab.x_input.unit.setText("с")
+    tab.y_input.label.setText("Путь $S$")
+    tab.y_input.unit.setText("м")
+    tab.calculate()
+    until(app, lambda: tab.result is not None)
+    assert tab.result.delta_x == [0.1] * 4
+    assert window.saved_results["k"][0] == "(м)/(с)"
+    assert window.saved_results["b"][1].mean == tab.result.b
+    reused = calculate_indirect_measurement("k * 2", {"k": window.saved_results["k"][1]})
+    assert reused.value == pytest.approx(tab.result.k * 2)
+    assert tab.figure.axes[0].get_xlabel() == "Время $t$, с"
+    assert len(tab.figure.axes[0].containers) == 1
+    for extension in ("png", "pdf"):
+        path = tmp_path / f"plot.{extension}"
+        monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args: (str(path), extension.upper()))
+        tab.save_plot()
+        assert path.stat().st_size > 1000
+        assert path.read_bytes().startswith(b"\x89PNG" if extension == "png" else b"%PDF")
+    revision = tab.revision
+    tab.x_input.errors.setText("0,3")
+    tab.x_input.unit.setText("мс")
+    tab.y_input.label.setText("Перемещение $S$")
+    assert tab.revision == revision + 3
+    tab.y_input.values.setPlainText("1 2 3 4")
+    assert tab.result is None
+    assert not tab.save_button.isEnabled()
+    assert not tab.figure.axes
+    assert "k" in window.saved_results
+
+
+def test_least_squares_memory_observations_refresh(app, window):
+    """Series and scalars retain precision and update when a source is replaced."""
+    from calc_engine import MeasurementValue
+
+    direct = calculate_direct_measurement([0, 1, 2], 0.15)
+    window.save_result("t", "с", direct)
+    axis = window.least_squares_tab.x_input
+    axis.mode.setCurrentIndex(1)
+    axis.sources.item(0).setSelected(True)
+    assert axis.observations() == ([0, 1, 2], [0.15] * 3)
+    window.save_result("t", "с", calculate_direct_measurement([2, 3, 4], 0.2))
+    assert axis.observations() == ([2, 3, 4], [0.2] * 3)
+    window.save_result("z", "с", MeasurementValue(1.23456789, 0.0123456789))
+    axis.sources.item(1).setSelected(True)
+    assert axis.observations() == ([2, 3, 4, 1.23456789], [0.2, 0.2, 0.2, 0.0123456789])
+
+
+def test_least_squares_invalid_and_stale_results(app, window, monkeypatch):
+    """Failures publish nothing and pending results cannot overwrite edited data."""
+    messages = []
+    monkeypatch.setattr(ErrorDialog, "exec", lambda self: messages.append(self.informativeText()))
+    tab = window.least_squares_tab
+    tab.x_input.values.setPlainText("1 1 1")
+    tab.y_input.values.setPlainText("1 2 3")
+    tab.calculate()
+    until(app, lambda: tab.calculate_button.isEnabled())
+    assert messages and not window.saved_results
+    tab.x_input.values.setPlainText("0 1 2")
+    tab.calculate()
+    tab.y_input.values.setPlainText("5 6 7")
+    until(app, lambda: tab.calculate_button.isEnabled())
+    assert tab.result is None and not window.saved_results
+
+
 @pytest.fixture(scope="module")
 def app():
     """Keep a single QApplication alive for all Qt integration checks."""
@@ -218,7 +293,7 @@ def test_result_formatting_keeps_zeros_and_small_uncertainties():
 
 def test_unequal_manual_weights_export_and_indirect_pool(app, window):
     tab = window.unequal_tab
-    assert window.tabs.count() == 3
+    assert window.tabs.count() == 4
     tab.name.setText("g")
     tab.unit.setText("м/с²")
     for row, mean, error in zip(tab.rows, [10, 20], [1, 2]):
