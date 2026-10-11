@@ -61,6 +61,19 @@ class MeasurementValue:
 
 
 @dataclass
+class UnequalMeasurementResult:
+    """Combined independent series, with unrounded weights and fractional contributions."""
+
+    mean: float
+    total_error: float
+    relative_error_pct: float
+    series: list[MeasurementValue]
+    weights: list[float]
+    contributions: list[float]
+    calculation_steps: str = ""
+
+
+@dataclass
 class IndirectMeasurementResult:
     """Unrounded function value, independent-error propagation and LaTeX formulas."""
 
@@ -102,6 +115,88 @@ def _real(value: Any, context: str) -> float:
 def _relative_error(value: float, error: float) -> float:
     """Return percentage error; a zero value has undefined (infinite) relative error."""
     return error / abs(value) * 100.0 if value else math.inf
+
+
+def calculate_unequal_measurements(
+    series_list: Sequence[MeasurementValue | DirectMeasurementResult],
+) -> UnequalMeasurementResult:
+    """Combine series using inverse squared absolute uncertainties.
+
+    Args:
+        series_list: Nonempty sequence of scalar or direct results. Uncertainties
+            must be strictly positive and refer to the same quantity and units.
+
+    Returns:
+        Weighted mean, internal uncertainty 1/sqrt(sum(weights)), and each
+        series' fractional contribution. Inputs are copied without rounding.
+
+    Raises:
+        InvalidInputError: Missing series, invalid means or nonpositive errors.
+        MathDomainError: A weight cannot be represented as a positive finite float.
+    """
+    if not isinstance(series_list, Sequence) or isinstance(series_list, (str, bytes)) or not series_list:
+        raise InvalidInputError("Добавьте хотя бы одну серию измерений.")
+    series = []
+    weights = []
+    for index, entry in enumerate(series_list, 1):
+        if not isinstance(entry, (MeasurementValue, DirectMeasurementResult)):
+            raise InvalidInputError(f"Серия {index}: требуется среднее и абсолютная погрешность.")
+        mean = _input_number(entry.mean, f"Серия {index}: среднее")
+        error = _input_number(entry.total_error, f"Серия {index}: погрешность")
+        if error <= 0:
+            raise InvalidInputError(f"Серия {index}: абсолютная погрешность должна быть строго больше нуля.")
+        # Avoid squaring the uncertainty before inversion (which may overflow).
+        weight = _real((1.0 / error) * (1.0 / error), f"Вес серии {index}")
+        if weight == 0:
+            raise MathDomainError(f"Вес серии {index} слишком мал для численного представления.")
+        series.append(MeasurementValue(mean, error))
+        weights.append(weight)
+    minimum_error = min(entry.total_error for entry in series)
+    scaled_weights = [(minimum_error / entry.total_error) ** 2 for entry in series]
+    scaled_sum = math.fsum(scaled_weights)
+    contributions = [weight / scaled_sum for weight in scaled_weights]
+    value_scale = max(abs(entry.mean) for entry in series)
+    mean = _real(
+        value_scale * math.fsum(part * (entry.mean / value_scale) for part, entry in zip(contributions, series))
+        if value_scale else 0.0,
+        "Взвешенное среднее",
+    )
+    error = minimum_error / math.sqrt(scaled_sum)
+    result = UnequalMeasurementResult(mean, error, _relative_error(mean, error), series, weights, contributions)
+    result.calculation_steps = _unequal_calculation_steps(result)
+    return result
+
+
+def _unequal_calculation_steps(result: UnequalMeasurementResult) -> str:
+    """Show the actual input pairs and substitutions without rounding the calculation."""
+    # Decimal is only for displaying sums: finite weights/products can sum to a
+    # value outside binary64 even though the normalized calculation is finite.
+    with localcontext() as context:
+        context.prec = 800
+        weight_sum = sum(Decimal(str(weight)) for weight in result.weights)
+        weighted_sum = sum(Decimal(str(weight)) * Decimal(str(entry.mean))
+                           for weight, entry in zip(result.weights, result.series))
+    steps = ["Исходные значения и веса серий:"]
+    for index, (entry, weight, contribution) in enumerate(zip(result.series, result.weights, result.contributions), 1):
+        steps.extend([
+            f"Серия {index}: x̄_{index} = {entry.mean!r}; Δx_{index} = {entry.total_error!r}",
+            f"w_{index} = 1/Δx_{index}² = 1/({entry.total_error!r})² = {weight!r}",
+            f"Вклад серии {index}: w_{index}/Σw · 100% = {weight!r}/({weight_sum:.17g}) · 100% = {100 * contribution!r} %",
+        ])
+    weights = " + ".join(repr(weight) for weight in result.weights)
+    products = " + ".join(f"({weight!r} × {entry.mean!r})" for weight, entry in zip(result.weights, result.series))
+    steps.extend([
+        "", "Подстановка в формулы объединения:",
+        f"Σw = {weights} = {weight_sum:.17g}",
+        f"Σ(w·x̄) = {products} = {weighted_sum:.17g}",
+        f"X̄_w = Σ(w·x̄)/Σw = ({weighted_sum:.17g})/({weight_sum:.17g}) = {result.mean!r}",
+        f"ΔX̄_w = 1/√Σw = 1/√({weight_sum:.17g}) = {result.total_error!r}",
+    ])
+    if result.mean:
+        steps.append(f"ε_w = ΔX̄_w/|X̄_w| · 100% = {result.total_error!r}/|{result.mean!r}| · 100% = {result.relative_error_pct!r} %")
+    else:
+        steps.append("ε_w не определена при нулевом среднем.")
+    return "\n".join(steps)
 
 
 def calculate_direct_measurement(
