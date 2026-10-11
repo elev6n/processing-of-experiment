@@ -11,6 +11,8 @@ from PySide6.QtWidgets import (
 from calc_engine import DirectMeasurementResult, InvalidInputError, calculate_direct_measurement
 from widgets.common import CalculationWorker, display, number, numeric_edit, result_text
 from widgets.error_dialog import ErrorDialog
+from widgets.unit_selector import UnitSelector, update_si_hint
+from units_engine import format_dimension, parse_unit
 
 
 class MeasurementTable(QTableWidget):
@@ -85,7 +87,7 @@ class DirectMeasurementTab(QWidget):
         settings = QGroupBox("Параметры величины")
         form = QHBoxLayout(settings)
         self.name = QLineEdit("d")
-        self.unit = QLineEdit("мм")
+        self.unit = UnitSelector("мм")
         self.theta = numeric_edit("0,00653", nonnegative=True)
         self.alpha = QComboBox()
         self.alpha.addItems(["0.90", "0.95", "0.99"])
@@ -95,6 +97,9 @@ class DirectMeasurementTab(QWidget):
             column.addRow(label, field)
             form.addLayout(column)
         layout.addWidget(settings)
+        self.si_hint = QLabel()
+        self.si_hint.setWordWrap(True)
+        layout.addWidget(self.si_hint)
         splitter = QSplitter(Qt.Orientation.Horizontal)
         input_box = QGroupBox("Измерения")
         input_layout = QVBoxLayout(input_box)
@@ -160,6 +165,15 @@ class DirectMeasurementTab(QWidget):
         for edit in [self.name, self.unit, self.theta]:
             edit.textChanged.connect(self.invalidate)
         self.alpha.currentTextChanged.connect(self.invalidate)
+        self.table.itemChanged.connect(self.refresh_si_hint)
+        self.theta.textChanged.connect(self.refresh_si_hint)
+        self.unit.textChanged.connect(self.refresh_si_hint)
+        self.refresh_si_hint()
+
+    def refresh_si_hint(self, *_args) -> None:
+        """Preview observations and instrumental uncertainty in SI."""
+        values = self.inputs()["measurements"]
+        update_si_hint(self.si_hint, self.unit.text(), values + [self.theta.text()])
 
     def invalidate(self, *_args) -> None:
         """Prevent old output from being copied after input edits."""
@@ -211,10 +225,12 @@ class DirectMeasurementTab(QWidget):
                 raise InvalidInputError("Добавьте хотя бы одно измерение.")
             theta = number(self.theta.text(), "Приборная погрешность", True)
             alpha = float(self.alpha.currentText())
-            self.pending = (self.revision, name, self.unit.text().strip(), inputs)
+            input_unit = self.unit.text().strip()
+            output_unit = format_dimension(parse_unit(input_unit).dimension) if input_unit else ""
+            self.pending = (self.revision, name, output_unit, inputs)
             self.calculate_button.setEnabled(False)
             self.calculate_button.setText("Вычисление…")
-            self.worker = CalculationWorker(lambda: calculate_direct_measurement(values, theta, alpha))
+            self.worker = CalculationWorker(lambda: calculate_direct_measurement(values, theta, alpha, input_unit))
             self.worker.signals.succeeded.connect(self.show_result)
             self.worker.signals.failed.connect(self.calculation_failed)
             QThreadPool.globalInstance().start(self.worker)
@@ -267,4 +283,4 @@ class DirectMeasurementTab(QWidget):
     def copy_result(self, latex: bool) -> None:
         """Copy the current rounded result using the selected representation."""
         if self.result:
-            QApplication.clipboard().setText(result_text(self.name.text().strip(), self.unit.text().strip(), self.result.mean, self.result.total_error, latex))
+            QApplication.clipboard().setText(result_text(self.name.text().strip(), self.result.unit, self.result.mean, self.result.total_error, latex))

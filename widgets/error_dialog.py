@@ -8,6 +8,7 @@ import traceback
 from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
 
 from calc_engine import FormulaParseError, InvalidInputError, MathDomainError
+from units_engine import InvalidUnitError
 
 
 class ErrorDialog(QMessageBox):
@@ -17,7 +18,9 @@ class ErrorDialog(QMessageBox):
         super().__init__(parent)
         self.setWindowTitle("Не удалось выполнить действие")
         self.setIcon(QMessageBox.Icon.Warning)
-        if isinstance(error, FormulaParseError):
+        if isinstance(error, InvalidUnitError):
+            message = "Проверьте единицы измерения и размерности формулы."
+        elif isinstance(error, FormulaParseError):
             message = "Ошибка в формуле. Проверьте скобки, имена переменных и операции."
         elif isinstance(error, InvalidInputError):
             message = "Проверьте введённые числа и погрешности."

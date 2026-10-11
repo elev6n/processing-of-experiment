@@ -14,6 +14,7 @@ from calc_engine import (
 )
 from widgets.common import CalculationWorker, display, number, numeric_edit, result_text
 from widgets.error_dialog import ErrorDialog
+from widgets.unit_selector import UnitSelector, bind_si_hint
 
 
 class SeriesRow(QGroupBox):
@@ -25,7 +26,8 @@ class SeriesRow(QGroupBox):
         self.source.addItem("Ввести вручную", None)
         self.mean = numeric_edit()
         self.error = numeric_edit()
-        self.unit = QLabel()
+        self.unit = UnitSelector()
+        self.si_hint = QLabel()
         self.remove_button = QPushButton("Удалить")
         layout = QHBoxLayout(self)
         for label, widget in [("Источник", self.source), ("Среднее x̄", self.mean), ("Погрешность Δx > 0", self.error)]:
@@ -33,6 +35,8 @@ class SeriesRow(QGroupBox):
             column.addRow(label, widget)
             layout.addLayout(column)
         layout.addWidget(self.unit)
+        layout.addWidget(self.si_hint)
+        bind_si_hint(self.mean, self.error, self.unit, self.si_hint)
         layout.addWidget(self.remove_button)
 
 
@@ -52,14 +56,14 @@ class UnequalMeasurementTab(QWidget):
         title = QLabel("Неравноточные измерения")
         title.setObjectName("pageTitle")
         layout.addWidget(title)
-        hint = QLabel("Объедините независимые серии одной величины в одинаковых единицах. "
+        hint = QLabel("Объедините независимые серии одной размерности. Единицы каждой серии автоматически переводятся в СИ. "
                       "Вес w = 1/Δx². Источник — сохранённый результат прямых, косвенных или неравноточных измерений.")
         hint.setWordWrap(True)
         layout.addWidget(hint)
         metadata = QGroupBox("Измеряемая величина")
         form = QFormLayout(metadata)
         self.name = QLineEdit("X")
-        self.unit = QLineEdit()
+        self.unit = UnitSelector()
         self.unit.setPlaceholderText("Например: м/с²")
         form.addRow("Символ результата", self.name)
         form.addRow("Единица измерения", self.unit)
@@ -149,6 +153,7 @@ class UnequalMeasurementTab(QWidget):
         self.populate_source(row)
         row.mean.textChanged.connect(self.invalidate)
         row.error.textChanged.connect(self.invalidate)
+        row.unit.textChanged.connect(self.invalidate)
         row.source.currentIndexChanged.connect(lambda _index: self.apply_source(row))
         row.remove_button.clicked.connect(lambda: self.remove_series(row))
         self.invalidate()
@@ -189,7 +194,7 @@ class UnequalMeasurementTab(QWidget):
         mean, error = result.mean, result.total_error
         if self.round_sources.isChecked():
             mean, error = round_measurement(mean, error)
-        return MeasurementValue(mean, error)
+        return MeasurementValue(mean, error, self.saved_results[source][0])
 
     def refresh_sources(self) -> None:
         """Apply the current precision mode to linked inputs only."""
@@ -209,6 +214,7 @@ class UnequalMeasurementTab(QWidget):
         linked = source in self.saved_results
         row.mean.setReadOnly(linked)
         row.error.setReadOnly(linked)
+        row.unit.setEnabled(not linked)
         row.unit.clear()
         if linked:
             unit, _ = self.saved_results[source]
@@ -223,7 +229,7 @@ class UnequalMeasurementTab(QWidget):
         return {
             "name": self.name.text().strip(), "unit": self.unit.text().strip(),
             "round_sources": self.round_sources.isChecked(),
-            "series": [{"source": row.source.currentData(), "mean": row.mean.text(), "error": row.error.text()} for row in self.rows],
+            "series": [{"source": row.source.currentData(), "mean": row.mean.text(), "error": row.error.text(), "unit": row.unit.text()} for row in self.rows],
         }
 
     def calculate(self) -> None:
@@ -242,9 +248,9 @@ class UnequalMeasurementTab(QWidget):
                     series.append(self.source_value(row["source"]))
                 else:
                     series.append(MeasurementValue(number(row["mean"], f"Серия {index}: среднее"),
-                                                   number(row["error"], f"Серия {index}: погрешность")))
+                                                   number(row["error"], f"Серия {index}: погрешность"), row["unit"] or inputs["unit"]))
             self.pending = (self.revision, inputs)
-            self.worker = CalculationWorker(lambda: calculate_unequal_measurements(series))
+            self.worker = CalculationWorker(lambda: calculate_unequal_measurements(series, inputs["unit"]))
             self.worker.signals.succeeded.connect(self.show_result)
             self.worker.signals.failed.connect(self.calculation_failed)
             self.calculate_button.setEnabled(False)
@@ -271,10 +277,10 @@ class UnequalMeasurementTab(QWidget):
         revision, inputs = self.pending
         if revision != self.revision:
             return
-        name, unit = inputs["name"], inputs["unit"]
+        name, unit = inputs["name"], result.unit
         # Publish first: replacing a selected source can refresh linked inputs.
         # Render the successful submitted snapshot afterward.
-        self.result_saved.emit(name, unit, MeasurementValue(result.mean, result.total_error))
+        self.result_saved.emit(name, unit, MeasurementValue(result.mean, result.total_error, unit))
         self.result = result
         self.output_table.setRowCount(len(result.series))
         largest = max(result.contributions)
@@ -307,7 +313,7 @@ class UnequalMeasurementTab(QWidget):
         """Copy the rounded result and relative uncertainty in the selected format."""
         if self.result is None:
             return
-        text = result_text(self.name.text().strip(), self.unit.text().strip(), self.result.mean, self.result.total_error, latex)
+        text = result_text(self.name.text().strip(), self.result.unit, self.result.mean, self.result.total_error, latex)
         if self.result.mean:
             relative = display(self.result.relative_error_pct)
             text += rf"\quad \varepsilon_w = {relative}\%" if latex else f"\nε = {relative} %"
